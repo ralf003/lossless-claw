@@ -122,6 +122,9 @@ export async function readTranscriptHeader(sessionFile: string): Promise<Transcr
     parentSession: null,
     sessionHeaderCreatedAt: null,
   };
+  if (isSqliteSessionFile(sessionFile)) {
+    return empty;
+  }
   try {
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
