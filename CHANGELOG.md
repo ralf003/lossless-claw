@@ -1,5 +1,38 @@
 # @martian-engineering/lossless-claw
 
+## 0.15.1
+
+### Patch Changes
+
+- [#1002](https://github.com/Martian-Engineering/lossless-claw/pull/1002) [`8ead658`](https://github.com/Martian-Engineering/lossless-claw/commit/8ead658e536e99444586bbf78ceedcc0b6f16acf) Thanks [@mpz4life](https://github.com/mpz4life)! - Skip deferred compaction retry backoff in assemble emergency drain when token pressure exceeds budget. The emergency drain now passes `force: true` to `consumeDeferredCompactionDebt`, bypassing the `nextAttemptAfter` backoff check so compaction can retry immediately instead of waiting for the backoff timer. Normal deferred drain paths (`drainDeferredCompactionDebtIfIdle`, `maintain`) continue to respect backoff. To prevent infinite retries when compaction persistently fails, `force: true` is only applied when `retryAttempts < 3`.
+
+- [#1007](https://github.com/Martian-Engineering/lossless-claw/pull/1007) [`4a99705`](https://github.com/Martian-Engineering/lossless-claw/commit/4a99705a32e24ffd8b00dce2396ba74f1e2ee914) Thanks [@mpz4life](https://github.com/mpz4life)! - Prevent stale deferred-compaction token counts from forcing repeated emergency drains after the stored context has already been compacted.
+
+- [#1020](https://github.com/Martian-Engineering/lossless-claw/pull/1020) [`a4842c2`](https://github.com/Martian-Engineering/lossless-claw/commit/a4842c2319fafd9211b0420773dca45f7fd9117f) Thanks [@jalehman](https://github.com/jalehman)! - Match `/lossless doctor clean` cron and archived-subagent candidates under every configured OpenClaw agent id. The cleaner now compares exact agent and lane segments so unrelated or malformed session keys remain excluded from scan and apply.
+
+- [#1018](https://github.com/Martian-Engineering/lossless-claw/pull/1018) [`0068006`](https://github.com/Martian-Engineering/lossless-claw/commit/0068006a74510889d898e1b4c14649e9eb02af78) Thanks [@jalehman](https://github.com/jalehman)! - Keep OpenClaw's preemptive overflow check enabled when deferred compaction debt forces Lossless Claw to return degraded live context.
+
+- [#1014](https://github.com/Martian-Engineering/lossless-claw/pull/1014) [`9af0795`](https://github.com/Martian-Engineering/lossless-claw/commit/9af07952cc874d0d30db157c33c9769c7e937c30) Thanks [@mpz4life](https://github.com/mpz4life)! - Avoid unnecessary after-turn compaction when OpenClaw does not provide a live prompt token count by evaluating the stored context without double-counting its raw prefix.
+
+- [#1011](https://github.com/Martian-Engineering/lossless-claw/pull/1011) [`224c267`](https://github.com/Martian-Engineering/lossless-claw/commit/224c26726a4d9318e1eb00ecbdedcf0e189f7126) Thanks [@mpz4life](https://github.com/mpz4life)! - Skip leaf compaction when selected raw messages are missing or contain no meaningful content, preventing zero-source fallback summaries and context growth. Full sweeps continue past empty-source chunks, clamp tracked token deltas at zero, and stop leaf passes once `stopAtTokens` is reached.
+
+- [#1026](https://github.com/Martian-Engineering/lossless-claw/pull/1026) [`80602dc`](https://github.com/Martian-Engineering/lossless-claw/commit/80602dc28b2ba1a9fbc5c45d7e4122fe9736edcb) Thanks [@ArthurNie](https://github.com/ArthurNie)! - Carry each message's role into the leaf-summary source text.
+
+  `CompactionEngine` dropped `role` when assembling the summarizer input, so a tool
+  result quoting another conversation was byte-identical to an operator instruction.
+  A summarizer reading that input can promote quoted material to current intent — the
+  summary then enters context as user-role text and the model follows it as the active
+  task. The header line now reads `[<timestamp> | <role>]`; message bodies are
+  unchanged and no schema migration is required.
+
+- [#1000](https://github.com/Martian-Engineering/lossless-claw/pull/1000) [`d3acd24`](https://github.com/Martian-Engineering/lossless-claw/commit/d3acd247024c48cf2cad8d33eb248d7f1cffc4ee) Thanks [@ralf003](https://github.com/ralf003)! - Avoid duplicate runtime rows with already-persisted transcript identities when a tracked transcript is temporarily unavailable, while preserving ambiguous rows that the unavailable transcript cannot recover.
+
+- [#1019](https://github.com/Martian-Engineering/lossless-claw/pull/1019) [`2dbf925`](https://github.com/Martian-Engineering/lossless-claw/commit/2dbf92500f6353c66a5f56780e51001a718bee01) Thanks [@jalehman](https://github.com/jalehman)! - Keep the newest user message and its following assistant/tool suffix together when fresh-tail count or token caps would otherwise split the active turn.
+
+- [#1029](https://github.com/Martian-Engineering/lossless-claw/pull/1029) [`4fd1132`](https://github.com/Martian-Engineering/lossless-claw/commit/4fd1132917fc12b3005a057c7e5323a82c385b5e) Thanks [@cxbAsDev](https://github.com/cxbAsDev)! - Correct the documented default for `LCM_LEAF_TARGET_TOKENS` in the README environment-variable table from `1200` to `2400`, matching the runtime default in `src/db/config.ts` and the configuration reference.
+
+- [#1012](https://github.com/Martian-Engineering/lossless-claw/pull/1012) [`5950a4a`](https://github.com/Martian-Engineering/lossless-claw/commit/5950a4ae73c9fe775ad851e41ea7d1c0a32b0f06) Thanks [@mpz4life](https://github.com/mpz4life)! - Respect `OPENCLAW_STATE_DIR` in all code paths. The `tui`, `stub-tier-live-watcher`, and `stub-tier-assemble-bench` scripts now honor the `OPENCLAW_STATE_DIR` environment variable instead of hardcoding `~/.openclaw`. A `resolveOpenclawStateDir` helper was extracted for `tui/data.go` matching the existing pattern in `src/db/config.ts`.
+
 ## 0.15.0
 
 <!-- release-rollback-version: 0.14.0 -->
