@@ -195,6 +195,11 @@ export type LcmConfig = {
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
   circuitBreakerCooldownMs: number;
+  /** Maximum consecutive non-progress compaction attempts before the
+   *  deferred compaction loop is force-exhausted. Set to 0 to disable
+   *  the breaker (no limit). Uses the durable maintenance-store
+   *  retryAttempts counter so the breaker survives restarts. Default: 10. */
+  compactionLoopMaxConsecutiveFailures?: number;
   /**
    * Anti-replay flood threshold for EXTERNAL-input roles (currently `user`).
    * Identical (conversation, role, content, created_at-in-seconds) tuples
@@ -844,6 +849,13 @@ export function resolveLcmConfigWithDiagnostics(
       circuitBreakerCooldownMs:
         parseFiniteInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS)
           ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
+      compactionLoopMaxConsecutiveFailures:
+        toIntegerAtLeast(
+          parseFiniteInt(env.LCM_COMPACTION_LOOP_MAX_CONSECUTIVE_FAILURES),
+          0,
+        )
+          ?? toIntegerAtLeast(toNumber(pc.compactionLoopMaxConsecutiveFailures), 0)
+          ?? undefined,
       replayFloodThresholdExternal:
         toStrictPositiveInteger(parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL))
           ?? toStrictPositiveInteger(toNumber(pc.replayFloodThresholdExternal)) ?? 3,
