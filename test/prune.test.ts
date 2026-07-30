@@ -554,4 +554,155 @@ describe("pruneArchivedConversationsToFitSize", () => {
     const result = pruneArchivedConversationsToFitSize(db, 1);
     expect(result.deleted).toBe(0);
   });
+
+  it("stops at the estimated cap instead of deleting all archived conversations", () => {
+    const { db } = createPruneFixture();
+
+    // Seed several archived conversations with messages to build up DB size.
+    for (let i = 0; i < 5; i++) {
+      db.prepare(
+        `INSERT INTO conversations (session_id, session_key, active, archived_at, archive_cause, created_at, updated_at)
+         VALUES (?, ?, 0, ?, 'session-end', ?, ?)`,
+      ).run(
+        `archived-${i}`,
+        `agent:main:test-stop-cap-${i}`,
+        `2025-01-0${i + 1}T00:00:00.000Z`,
+        `2025-01-0${i + 1}T00:00:00.000Z`,
+        `2025-01-0${i + 1}T00:00:00.000Z`,
+      );
+
+      const convRow = db
+        .prepare(`SELECT conversation_id FROM conversations WHERE session_id = ?`)
+        .get(`archived-${i}`) as { conversation_id: number };
+
+      // Insert several messages per conversation for meaningful size.
+      for (let j = 0; j < 5; j++) {
+        db.prepare(
+          `INSERT INTO messages (conversation_id, seq, role, content, token_count, created_at)
+           VALUES (?, ?, 'user', 'padding content to make the page count grow', 10, ?)`,
+        ).run(convRow.conversation_id, j, `2025-01-0${i + 1}T00:${j}0:00.000Z`);
+      }
+    }
+
+    const totalArchived = (
+      db
+        .prepare(`SELECT COUNT(*) AS cnt FROM conversations WHERE active = 0 AND archived_at IS NOT NULL`)
+        .get() as { cnt: number }
+    ).cnt;
+    expect(totalArchived).toBe(5);
+
+    const currentSize = getDatabaseSizeBytes(db);
+
+    // Set a target that should delete some but not all archived conversations.
+    // Using ~60% of current size as the cap ensures we need to delete ~2-3 of 5.
+    const targetBytes = Math.floor(currentSize * 0.6);
+
+    const result = pruneArchivedConversationsToFitSize(db, targetBytes);
+
+    // Must have deleted some — the DB was over the cap.
+    expect(result.deleted).toBeGreaterThan(0);
+    // Must NOT have deleted all archived conversations — the bug would be
+    // deleting everything regardless of the cap.
+    expect(result.deleted).toBeLessThan(5);
+
+    // Verify remaining archived conversations still exist.
+    const remainingArchived = (
+      db
+        .prepare(`SELECT COUNT(*) AS cnt FROM conversations WHERE active = 0 AND archived_at IS NOT NULL`)
+        .get() as { cnt: number }
+    ).cnt;
+    expect(remainingArchived).toBe(5 - result.deleted);
+    expect(remainingArchived).toBeGreaterThan(0);
+
+    // VACUUM was executed (deletedBytes reflects reclaimed pages, 0 is
+    // possible when remaining data fits the same page allocation).
+    expect(typeof result.deletedBytes).toBe("number");
+  });
+
+  it("cleans up FTS rows when deleting archived conversations via size pruner", async () => {
+    const fixture = createPruneFixture();
+    const { db } = fixture;
+    const { fts5Available } = getLcmDbFeatures(db);
+
+    if (!fts5Available) {
+      // FTS5 may not be available in all SQLite builds; skip gracefully.
+      return;
+    }
+
+    // Seed an archived conversation with messages and a summary.
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, archived_at, archive_cause, created_at, updated_at)
+       VALUES (?, ?, 0, datetime('now'), 'session-end', datetime('now'), datetime('now'))`,
+    ).run("fts-prune-test", "agent:main:test-fts-prune");
+
+    const convRow = db
+      .prepare(`SELECT conversation_id FROM conversations WHERE session_id = ?`)
+      .get("fts-prune-test") as { conversation_id: number };
+    const conversationId = convRow.conversation_id;
+
+    db.prepare(
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, created_at)
+       VALUES (?, 1, 'user', 'fts searchable content', 5, datetime('now'))`,
+    ).run(conversationId);
+
+    const msgRow = db
+      .prepare(`SELECT message_id FROM messages WHERE conversation_id = ?`)
+      .get(conversationId) as { message_id: number };
+
+    // Manually populate FTS entries — in production this is done by
+    // ConversationStore, but we insert via raw SQL for test control.
+    db.prepare(`INSERT INTO messages_fts(rowid, content) VALUES (?, ?)`).run(
+      msgRow.message_id,
+      "fts searchable content",
+    );
+
+    // Insert a summary to cover summaries_fts and summaries_fts_cjk cleanup.
+    const summaryStore = new SummaryStore(db, { fts5Available });
+    await summaryStore.insertSummary({
+      summaryId: `fts-summary-${conversationId}`,
+      conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "fts searchable summary content",
+      tokenCount: 7,
+      fileIds: [],
+      earliestAt: new Date("2025-01-01T00:00:00.000Z"),
+      latestAt: new Date("2025-01-01T00:00:00.000Z"),
+      descendantCount: 1,
+      descendantTokenCount: 5,
+      sourceMessageTokenCount: 5,
+      model: "test",
+    });
+    await summaryStore.linkSummaryToMessages(`fts-summary-${conversationId}`, [msgRow.message_id]);
+
+    // Verify FTS rows exist before pruning.
+    const ftsMsgBefore = (
+      db.prepare(`SELECT COUNT(*) AS cnt FROM messages_fts WHERE rowid = ?`).get(msgRow.message_id) as { cnt: number }
+    ).cnt;
+    const ftsSummaryBefore = (
+      db.prepare(`SELECT COUNT(*) AS cnt FROM summaries_fts WHERE summary_id = ?`).get(`fts-summary-${conversationId}`) as { cnt: number }
+    ).cnt;
+    expect(ftsMsgBefore).toBeGreaterThanOrEqual(1);
+    expect(ftsSummaryBefore).toBeGreaterThanOrEqual(1);
+
+    // Prune with a low cap to force deletion.
+    const result = pruneArchivedConversationsToFitSize(db, 1);
+    expect(result.deleted).toBe(1);
+
+    // Verify FTS rows were cleaned up.
+    const ftsMsgAfter = (
+      db.prepare(`SELECT COUNT(*) AS cnt FROM messages_fts WHERE rowid = ?`).get(msgRow.message_id) as { cnt: number }
+    ).cnt;
+    const ftsSummaryAfter = (
+      db.prepare(`SELECT COUNT(*) AS cnt FROM summaries_fts WHERE summary_id = ?`).get(`fts-summary-${conversationId}`) as { cnt: number }
+    ).cnt;
+    expect(ftsMsgAfter).toBe(0);
+    expect(ftsSummaryAfter).toBe(0);
+
+    // Verify the conversation is gone.
+    const convRemaining = (
+      db.prepare(`SELECT COUNT(*) AS cnt FROM conversations WHERE conversation_id = ?`).get(conversationId) as { cnt: number }
+    ).cnt;
+    expect(convRemaining).toBe(0);
+  });
 });

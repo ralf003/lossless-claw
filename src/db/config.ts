@@ -790,10 +790,17 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined
           ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
           : toBool(pc.pruneHeartbeatOk) ?? false,
-      maxDatabaseBytes:
-        toPositiveInteger(parseFiniteInt(env.LCM_MAX_DATABASE_BYTES))
-          ?? toPositiveInteger(toNumber(pc.maxDatabaseBytes))
-          ?? 0,
+      maxDatabaseBytes: (() => {
+        // 0 means "unlimited" — guard before toPositiveInteger so it isn't
+        // silently coerced to 1 (Math.max(1, 0)).
+        const envVal = parseFiniteInt(env.LCM_MAX_DATABASE_BYTES);
+        if (envVal === 0) return 0;
+        const envPositive = toPositiveInteger(envVal);
+        if (envPositive != null) return envPositive;
+        const pcVal = toNumber(pc.maxDatabaseBytes);
+        if (pcVal === 0) return 0;
+        return toPositiveInteger(pcVal) ?? 0;
+      })(),
       transcriptGcEnabled:
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"

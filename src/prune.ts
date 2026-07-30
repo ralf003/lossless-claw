@@ -402,6 +402,11 @@ export type PruneSizeResult = {
 
 /**
  * Return the current database file size in bytes using SQLite page stats.
+ *
+ * NOTE: After DELETE operations in WAL mode, freed pages go to the free-list —
+ * `page_count` does NOT decrease until VACUUM reclaims them.  This function is
+ * therefore only reliable as a pre-deletion baseline, not as a live progress
+ * indicator during size-based pruning.
  */
 export function getDatabaseSizeBytes(db: DatabaseSync): number {
   const pageCount = (
@@ -413,13 +418,70 @@ export function getDatabaseSizeBytes(db: DatabaseSync): number {
   return pageCount * pageSize;
 }
 
+const SELECT_ARCHIVED_PRUNE_CANDIDATES_SQL = `SELECT
+   c.conversation_id,
+   c.session_key,
+   COALESCE(msg_stats.message_count, 0) AS message_count,
+   COALESCE(sum_stats.summary_count, 0) AS summary_count,
+   COALESCE(msg_stats.latest_message_at, c.created_at) AS latest_message_at,
+   c.created_at
+ FROM conversations c
+ LEFT JOIN (
+   SELECT conversation_id,
+          COUNT(*) AS message_count,
+          MAX(created_at) AS latest_message_at
+   FROM messages
+   GROUP BY conversation_id
+ ) msg_stats ON msg_stats.conversation_id = c.conversation_id
+ LEFT JOIN (
+   SELECT conversation_id,
+          COUNT(*) AS summary_count
+   FROM summaries
+   GROUP BY conversation_id
+ ) sum_stats ON sum_stats.conversation_id = c.conversation_id
+ WHERE c.active = 0 AND c.archived_at IS NOT NULL
+ ORDER BY c.archived_at ASC,
+          c.conversation_id ASC`;
+
 /**
- * Delete the oldest archived conversations (active=0) until the database
- * size drops below maxBytes (or no archived conversations remain).
+ * Load archived conversation prune candidates ordered by `archived_at` (oldest
+ * first), so size-based pruning deletes the least-recently-archived data first.
+ */
+function loadArchivedPruneCandidates(
+  db: DatabaseSync,
+  limit?: number,
+): PruneCandidate[] {
+  const sql =
+    limit == null
+      ? SELECT_ARCHIVED_PRUNE_CANDIDATES_SQL
+      : `${SELECT_ARCHIVED_PRUNE_CANDIDATES_SQL}\n LIMIT ?`;
+  const rows = (
+    limit == null
+      ? db.prepare(sql).all()
+      : db.prepare(sql).all(limit)
+  ) as PruneCandidateRow[];
+  return rows.map((row) => ({
+    conversationId: row.conversation_id,
+    sessionKey: row.session_key,
+    messageCount: row.message_count,
+    summaryCount: row.summary_count,
+    latestMessageAt: row.latest_message_at,
+    createdAt: row.created_at,
+  }));
+}
+
+/**
+ * Delete the oldest archived conversations (active=0, archived_at IS NOT NULL)
+ * until the estimated database size drops below `maxBytes` (or no archived
+ * conversations remain).
  *
- * Each conversation is deleted in its own transaction.  The caller should
- * call VACUUM separately if desired (VACUUM is expensive and may block
- * concurrent writers).
+ * Because SQLite in WAL mode does not shrink `page_count` after DELETE (freed
+ * pages land in the free-list until VACUUM), we pre-compute a target deletion
+ * count from the initial size and then delete that many candidates using
+ * {@link deleteCandidates} — which also cleans up the FTS5 virtual tables
+ * (`messages_fts`, `summaries_fts`, `summaries_fts_cjk`).  After all batches
+ * complete a VACUUM reclaims the freed pages and `deletedBytes` reflects the
+ * actual reduction.
  *
  * @param largeFilesDir  When provided, the on-disk large-file directories
  *                       for deleted conversations are removed.
@@ -432,8 +494,6 @@ export function pruneArchivedConversationsToFitSize(
     largeFilesDir?: string;
   },
 ): PruneSizeResult {
-  let deleted = 0;
-  let deletedBytes = 0;
   const batchSize = Math.min(
     options?.batchSize && options.batchSize > 0 ? Math.floor(options.batchSize) : 10,
     100,
@@ -444,41 +504,57 @@ export function pruneArchivedConversationsToFitSize(
     return { deleted: 0, deletedBytes: 0 };
   }
 
-  const beforeSize = currentSize;
-
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const sizeNow = getDatabaseSizeBytes(db);
-    if (sizeNow <= maxBytes) {
-      break;
-    }
-
-    const rows = db
+  // Count total archived conversations for the size estimate
+  const totalArchived = (
+    db
       .prepare(
-        `SELECT conversation_id FROM conversations
-         WHERE active = 0 AND archived_at IS NOT NULL
-         ORDER BY archived_at ASC
-         LIMIT ?`,
+        `SELECT COUNT(*) AS cnt FROM conversations WHERE active = 0 AND archived_at IS NOT NULL`,
       )
-      .all(batchSize) as { conversation_id: number }[];
+      .get() as { cnt: number }
+  ).cnt;
+  if (totalArchived === 0) {
+    return { deleted: 0, deletedBytes: 0 };
+  }
 
-    if (rows.length === 0) {
-      break;
-    }
+  // We can't rely on page_count for live progress (WAL free-list), so
+  // pre-compute a target deletion count using a rough per-conversation
+  // estimate.  After all batches complete a VACUUM reclaims the freed pages.
+  const totalConversations = (
+    db.prepare(`SELECT COUNT(*) AS cnt FROM conversations`).get() as { cnt: number }
+  ).cnt;
+  const bytesPerConversation = Math.max(
+    1,
+    Math.floor(currentSize / Math.max(1, totalConversations)),
+  );
+  const targetToDelete = Math.min(
+    totalArchived,
+    Math.ceil((currentSize - maxBytes) / bytesPerConversation),
+  );
 
-    const ids = rows.map((r) => r.conversation_id);
+  let deleted = 0;
+  let remainingToDelete = targetToDelete;
+
+  while (remainingToDelete > 0) {
+    const batch = loadArchivedPruneCandidates(
+      db,
+      Math.min(batchSize, remainingToDelete),
+    );
+    if (batch.length === 0) break;
 
     db.exec("BEGIN IMMEDIATE");
     try {
       if (options?.largeFilesDir) {
-        for (const id of ids) {
+        for (const c of batch) {
           try {
-            rmSync(join(options.largeFilesDir, String(id)), { recursive: true, force: true });
+            rmSync(join(options.largeFilesDir, String(c.conversationId)), {
+              recursive: true,
+              force: true,
+            });
           } catch (err) {
             // ENOENT: directory never existed or was already cleaned — fine.
             if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
               console.warn(
-                `prune: failed to remove large files directory for conversation ${id}:`,
+                `prune: failed to remove large files directory for conversation ${c.conversationId}:`,
                 (err as Error).message ?? err,
               );
             }
@@ -486,22 +562,25 @@ export function pruneArchivedConversationsToFitSize(
         }
       }
 
-      const placeholder = ids.map(() => "?").join(",");
-      const deletedConversations = Number(
-        db
-          .prepare(`DELETE FROM conversations WHERE conversation_id IN (${placeholder})`)
-          .run(...ids).changes ?? 0,
-      );
-
+      const deletedCount = deleteCandidates(db, batch);
+      deleted += deletedCount;
+      remainingToDelete -= batch.length;
       db.exec("COMMIT");
-      deleted += deletedConversations;
     } catch {
       db.exec("ROLLBACK");
       break;
     }
+  }
 
+  // Reclaim freed pages now that data has been deleted.
+  let deletedBytes = 0;
+  if (deleted > 0) {
+    db.exec("VACUUM");
+    // VACUUM in WAL mode can leave the reclaimed pages in the WAL file until
+    // a checkpoint folds them back into the main database.
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     const newSize = getDatabaseSizeBytes(db);
-    deletedBytes = Math.max(0, beforeSize - newSize);
+    deletedBytes = Math.max(0, currentSize - newSize);
   }
 
   return { deleted, deletedBytes };
