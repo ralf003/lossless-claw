@@ -187,7 +187,7 @@ describe("sqlite: session file no-op guards", () => {
 
   it("readTranscriptHeader returns empty header for sqlite: path", async () => {
     const result = await readTranscriptHeader("sqlite:conversation/42");
-    expect(result).toEqual({ sessionHeaderId: null, parentSession: null });
+    expect(result).toEqual({ sessionHeaderId: null, parentSession: null, sessionHeaderCreatedAt: null });
   });
 
   it("readLeafPathRawEntries returns empty result for sqlite: path", async () => {
